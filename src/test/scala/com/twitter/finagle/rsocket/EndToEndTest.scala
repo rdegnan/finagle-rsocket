@@ -3,7 +3,7 @@ package com.twitter.finagle.rsocket
 import com.twitter.finagle.param.Stats
 import com.twitter.finagle.stats.{NullStatsReceiver, StatsReceiver}
 import com.twitter.finagle.{RSocket, Service, rsocket}
-import com.twitter.util.{Await, Closable, Duration, Future}
+import com.twitter.util.{Await, Closable, Duration, Future, Futures, Promise}
 import io.rsocket.util.DefaultPayload
 import java.net.InetSocketAddress
 import org.scalatest.FunSuite
@@ -82,17 +82,22 @@ private object EndToEndTest {
       service: Service[rsocket.Request, rsocket.Response],
       stats: StatsReceiver = NullStatsReceiver
   )(run: Service[rsocket.Request, rsocket.Response] => Future[_]): Unit = {
+    val runServer = Promise[Any]()
     val server = RSocket.server
       .withLabel("server")
       .configured(Stats(stats))
+      .onConnect(client => run(client).proxyTo(runServer))
       .serve("localhost:*", service)
 
     val addr = server.boundAddress.asInstanceOf[InetSocketAddress]
 
     val client = RSocket.client
       .configured(Stats(stats))
+      .serve(service)
       .newService(s"${addr.getHostName}:${addr.getPort}", "client")
 
-    Await.result(run(client).ensure(Closable.all(client, server).close()), Duration.fromSeconds(1))
+    Await.result(
+        Futures.join(run(client), runServer).ensure(Closable.all(client, server).close()),
+        Duration.fromSeconds(1))
   }
 }
