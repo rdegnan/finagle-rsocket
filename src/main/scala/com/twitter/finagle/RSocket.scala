@@ -6,13 +6,11 @@ import com.twitter.finagle.param.{Label, ProtocolLibrary}
 import com.twitter.finagle.rsocket._
 import com.twitter.finagle.server.{ListeningStackServer, StackServer}
 import com.twitter.util.{CloseAwaitably, Future, Time}
+import io.rsocket.RSocket
 import io.rsocket.core.{RSocketConnector, RSocketServer, Resume}
 import io.rsocket.transport.netty.client.TcpClientTransport
 import io.rsocket.transport.netty.server.{CloseableChannel, TcpServerTransport}
-import io.rsocket.{Payload, RSocket}
 import java.net.SocketAddress
-import org.reactivestreams.Publisher
-import reactor.core.publisher.{Flux, Mono}
 import reactor.netty.tcp.{TcpClient, TcpServer}
 import reactor.util.retry.Retry
 
@@ -28,54 +26,13 @@ private class TcpListeningServer(channel: CloseableChannel)
     }
 }
 
-private class ServiceFactoryRSocket(factory: ServiceFactory[rsocket.Request, rsocket.Response])
-    extends RSocket {
-  override def fireAndForget(payload: Payload): Mono[Void] =
-    factory.toService(Request.FireAndForget(payload)).toMono.flatMap {
-      case Response.FireAndForget(payload) => payload
-    }
-
-  override def requestResponse(payload: Payload): Mono[Payload] =
-    factory.toService(Request.RequestResponse(payload)).toMono.flatMap {
-      case Response.RequestResponse(payload) => payload
-    }
-
-  override def requestStream(payload: Payload): Flux[Payload] =
-    factory.toService(Request.RequestStream(payload)).toMono.flatMapMany {
-      case Response.RequestStream(payloads) => payloads
-    }
-
-  override def requestChannel(payloads: Publisher[Payload]): Flux[Payload] =
-    factory.toService(Request.RequestChannel(payloads)).toMono.flatMapMany {
-      case Response.RequestChannel(payloads) => payloads
-    }
-}
-
-private class RSocketService(rSocket: RSocket) extends Service[rsocket.Request, rsocket.Response] {
-  override def apply(request: Request): Future[Response] =
-    Future {
-      request match {
-        case Request.FireAndForget(payload) =>
-          Response.FireAndForget(rSocket.fireAndForget(payload))
-        case Request.RequestResponse(payload) =>
-          Response.RequestResponse(rSocket.requestResponse(payload))
-        case Request.RequestStream(payload) =>
-          Response.RequestStream(rSocket.requestStream(payload))
-        case Request.RequestChannel(payloads) =>
-          Response.RequestChannel(rSocket.requestChannel(payloads))
-      }
-    }
-}
-
-object RSocket
-    extends Client[rsocket.Request, rsocket.Response]
-    with Server[rsocket.Request, rsocket.Response] {
+object RSocket extends Client[Unit, RSocket] with Server[RSocket, RSocket] {
   final case class TcpRSocketClient(
-      stack: Stack[ServiceFactory[rsocket.Request, rsocket.Response]] = StackClient.newStack,
+      stack: Stack[ServiceFactory[Unit, RSocket]] = StackClient.newStack,
       params: Stack.Params = StackClient.defaultParams)
-      extends EndpointerStackClient[rsocket.Request, rsocket.Response, TcpRSocketClient] {
-    override def endpointer: Stackable[ServiceFactory[rsocket.Request, rsocket.Response]] =
-      new EndpointerModule[rsocket.Request, rsocket.Response](
+      extends EndpointerStackClient[Unit, RSocket, TcpRSocketClient] {
+    override def endpointer: Stackable[ServiceFactory[Unit, RSocket]] =
+      new EndpointerModule[Unit, RSocket](
           Seq(implicitly[Stack.Param[ProtocolLibrary]], implicitly[Stack.Param[Label]]), {
             (params: Stack.Params, sa: SocketAddress) =>
               //TODO: configure client based on params
@@ -87,7 +44,7 @@ object RSocket
 
               // Note, this ensures that session establishment is lazy (i.e.,
               // on the service acquisition path).
-              ServiceFactory[rsocket.Request, rsocket.Response] {
+              ServiceFactory[Unit, RSocket] {
                 () =>
                   // we do not want to capture and request specific Locals
                   // that would live for the life of the session.
@@ -97,21 +54,22 @@ object RSocket
                     params[rsocket.param.Reconnection].retry.foreach(connector.reconnect)
                     params[rsocket.param.Resumption].resume.foreach(connector.resume)
                     params[rsocket.param.ClientServiceFactory].factory.foreach { factory =>
-                      val rSocket = new ServiceFactoryRSocket(factory)
-                      connector.acceptor((setup, sendingSocket) => Mono.just(rSocket))
+                      connector.acceptor((setup, sendingSocket) =>
+                        factory.toService(sendingSocket).toMono)
                     }
 
-                    connector
-                      .connect(transport)
-                      .toTwitterFuture
-                      .map(new RSocketService(_))
+                    Future { _ =>
+                      connector
+                        .connect(transport)
+                        .toTwitterFuture
+                    }
                   }
               }
           }
       )
 
     override def copy1(
-        stack: Stack[ServiceFactory[rsocket.Request, rsocket.Response]],
+        stack: Stack[ServiceFactory[Unit, RSocket]],
         params: Stack.Params
     ): TcpRSocketClient = copy(stack, params)
 
@@ -124,10 +82,10 @@ object RSocket
     def resume(resume: Resume): TcpRSocketClient =
       this.configured(rsocket.param.Resumption(Some(resume)))
 
-    def serve(service: ServiceFactory[rsocket.Request, rsocket.Response]): TcpRSocketClient =
+    def serve(service: ServiceFactory[io.rsocket.RSocket, io.rsocket.RSocket]): TcpRSocketClient =
       this.configured(rsocket.param.ClientServiceFactory(Some(service)))
 
-    def serve(service: Service[rsocket.Request, rsocket.Response]): TcpRSocketClient =
+    def serve(service: Service[io.rsocket.RSocket, io.rsocket.RSocket]): TcpRSocketClient =
       this.configured(rsocket.param.ClientServiceFactory(Some(ServiceFactory.const(service))))
   }
 
@@ -136,44 +94,41 @@ object RSocket
   override def newService(
       dest: Name,
       label: String
-  ): Service[rsocket.Request, rsocket.Response] = client.newService(dest, label)
+  ): Service[Unit, RSocket] = client.newService(dest, label)
 
   override def newClient(
       dest: Name,
       label: String
-  ): ServiceFactory[rsocket.Request, rsocket.Response] = client.newClient(dest, label)
+  ): ServiceFactory[Unit, RSocket] = client.newClient(dest, label)
 
   final case class TcpRSocketServer(
-      stack: Stack[ServiceFactory[rsocket.Request, rsocket.Response]] = StackServer.newStack,
+      stack: Stack[ServiceFactory[RSocket, RSocket]] = StackServer.newStack,
       params: Stack.Params = StackServer.defaultParams)
-      extends ListeningStackServer[rsocket.Request, rsocket.Response, TcpRSocketServer] {
+      extends ListeningStackServer[RSocket, RSocket, TcpRSocketServer] {
     //TODO: configure server based on params
     private val tcpServer = TcpServer.create()
 
-    override def newListeningServer(
-        factory: ServiceFactory[rsocket.Request, rsocket.Response],
-        addr: SocketAddress)(trackSession: ClientConnection => Unit): ListeningServer = {
+    override def newListeningServer(factory: ServiceFactory[RSocket, RSocket], addr: SocketAddress)(
+        trackSession: ClientConnection => Unit): ListeningServer = {
       //TODO: expose ClientConnection callback to track session
       val transport = TcpServerTransport.create(tcpServer.bindAddress(() => addr))
       val server = RSocketServer.create()
       params[rsocket.param.Fragmentation].mtu.foreach(server.fragment)
       params[rsocket.param.Resumption].resume.foreach(server.resume)
 
-      val rSocket = new ServiceFactoryRSocket(factory)
       val channel = server
         .acceptor((setup, sendingSocket) => {
           params[rsocket.param.ServerOnConnect].onConnect.foreach { onConnect =>
-            val service = new RSocketService(sendingSocket)
-            onConnect(service)
+            onConnect(sendingSocket)
           }
-          Mono.just(rSocket)
+          factory.toService(sendingSocket).toMono
         })
         .bindNow(transport)
       new TcpListeningServer(channel)
     }
 
     override def copy1(
-        stack: Stack[ServiceFactory[rsocket.Request, rsocket.Response]],
+        stack: Stack[ServiceFactory[RSocket, RSocket]],
         params: Stack.Params
     ): TcpRSocketServer = copy(stack, params)
 
@@ -183,7 +138,7 @@ object RSocket
     def resume(resume: Resume): TcpRSocketServer =
       this.configured(rsocket.param.Resumption(Some(resume)))
 
-    def onConnect(onConnect: Service[rsocket.Request, rsocket.Response] => Unit): TcpRSocketServer =
+    def onConnect(onConnect: RSocket => Unit): TcpRSocketServer =
       this.configured(rsocket.param.ServerOnConnect(Some(onConnect)))
   }
 
@@ -191,6 +146,6 @@ object RSocket
 
   override def serve(
       addr: SocketAddress,
-      service: ServiceFactory[rsocket.Request, rsocket.Response]): ListeningServer =
+      service: ServiceFactory[RSocket, RSocket]): ListeningServer =
     server.serve(addr, service)
 }

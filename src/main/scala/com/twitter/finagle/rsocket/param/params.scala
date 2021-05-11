@@ -1,6 +1,7 @@
 package com.twitter.finagle.rsocket.param
 
-import com.twitter.finagle.{Service, ServiceFactory, Stack, rsocket}
+import com.twitter.finagle.{Service, ServiceFactory, Stack}
+import io.rsocket.RSocket
 import io.rsocket.core.Resume
 import reactor.util.retry.Retry
 
@@ -29,7 +30,7 @@ object Resumption {
 }
 
 case class ClientServiceFactory(
-    factory: Option[ServiceFactory[rsocket.Request, rsocket.Response]]) {
+    factory: Option[ServiceFactory[io.rsocket.RSocket, io.rsocket.RSocket]]) {
   def mk(): (ClientServiceFactory, Stack.Param[ClientServiceFactory]) =
     (this, ClientServiceFactory.param)
 }
@@ -37,7 +38,7 @@ object ClientServiceFactory {
   implicit val param = Stack.Param(ClientServiceFactory(None))
 }
 
-case class ServerOnConnect(onConnect: Option[Service[rsocket.Request, rsocket.Response] => Unit]) {
+case class ServerOnConnect(onConnect: Option[RSocket => Unit]) {
   def mk(): (ServerOnConnect, Stack.Param[ServerOnConnect]) =
     (this, ServerOnConnect.param)
 }
